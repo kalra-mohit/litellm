@@ -315,19 +315,18 @@ export function KeyEditView({
       // Sending [] clears every window, so send it only when the user removed
       // the last one; leave the field off otherwise (JSON.stringify drops the
       // undefined key) so incomplete or unchanged state never clobbers storage.
+      // A sorted list (not a Set) preserves multiplicity so removing a duplicate
+      // window still registers as a change, matching the backend comparison.
       const windowSignature = (windows: Array<{ budget_duration: string; max_budget: number | null }> | undefined) =>
-        new Set(
-          (windows ?? [])
-            .filter((w) => w.budget_duration && w.max_budget !== null && w.max_budget !== undefined)
-            .map((w) => `${w.budget_duration}:${w.max_budget}`),
-        );
+        (windows ?? [])
+          .filter((w) => w.budget_duration && w.max_budget !== null && w.max_budget !== undefined)
+          .map((w) => `${w.budget_duration}:${w.max_budget}`)
+          .sort()
+          .join("|");
       const validWindows = budgetLimits.filter(
         (w) => w.budget_duration && w.max_budget !== null && w.max_budget !== undefined,
       );
-      const storedWindows = windowSignature(keyData.budget_limits);
-      const submittedWindows = windowSignature(validWindows);
-      const budgetLimitsUnchanged =
-        storedWindows.size === submittedWindows.size && [...submittedWindows].every((w) => storedWindows.has(w));
+      const budgetLimitsUnchanged = windowSignature(keyData.budget_limits) === windowSignature(validWindows);
       if (budgetLimitsUnchanged) {
         // no-op: leave budget_limits off the payload
       } else if (validWindows.length > 0) {

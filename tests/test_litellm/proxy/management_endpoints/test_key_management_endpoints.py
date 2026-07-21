@@ -1942,7 +1942,8 @@ async def test_prepare_key_update_data_duration_none_never_expires():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cleared_value", [[], None])
 async def test_prepare_key_update_data_budget_limits_clears_field(cleared_value):
-    """budget_limits=[] / None must serialize to JSON null, never reach Prisma raw."""
+    """Clearing a REAL stored window (budget_limits=[] / None) must serialize to
+    JSON null, never reach Prisma raw."""
     from litellm.proxy._types import UpdateKeyRequest
     from litellm.proxy.management_endpoints.key_management_endpoints import (
         prepare_key_update_data,
@@ -1955,6 +1956,7 @@ async def test_prepare_key_update_data_budget_limits_clears_field(cleared_value)
         user_id="test-user",
         team_id=None,
         metadata={},
+        budget_limits=[{"budget_duration": "30d", "max_budget": 100.0, "reset_at": "2026-08-01T00:00:00"}],
     )
 
     update_request = UpdateKeyRequest(key="test-token", budget_limits=cleared_value)
@@ -1964,6 +1966,68 @@ async def test_prepare_key_update_data_budget_limits_clears_field(cleared_value)
     )
 
     assert result["budget_limits"] == json.dumps(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleared_value", [[], None])
+async def test_prepare_key_update_data_budget_limits_empty_on_no_windows_is_dropped(cleared_value):
+    """Clearing a key that has no stored windows is a no-op, so budget_limits is
+    dropped from the write payload instead of persisting a redundant JSON null."""
+    from litellm.proxy._types import UpdateKeyRequest
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        prepare_key_update_data,
+    )
+
+    existing_key = LiteLLM_VerificationToken(
+        token="test-token",
+        key_alias="test-key",
+        models=["gpt-3.5-turbo"],
+        user_id="test-user",
+        team_id=None,
+        metadata={},
+        budget_limits=None,
+    )
+
+    update_request = UpdateKeyRequest(key="test-token", budget_limits=cleared_value)
+
+    result = await prepare_key_update_data(
+        data=update_request, existing_key_row=existing_key
+    )
+
+    assert "budget_limits" not in result
+
+
+@pytest.mark.asyncio
+async def test_prepare_key_update_data_budget_limits_unchanged_resend_not_written():
+    """An unchanged resend of the stored windows (issue #33246: the dashboard
+    re-sends existing windows on every save) must drop budget_limits from the
+    write so a concurrent admin edit isn't clobbered. reset_at is server-owned,
+    so its absence in the resend must not read as a change."""
+    from litellm.proxy._types import UpdateKeyRequest
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        prepare_key_update_data,
+    )
+
+    existing_key = LiteLLM_VerificationToken(
+        token="test-token",
+        key_alias="test-key",
+        models=["gpt-3.5-turbo"],
+        user_id="test-user",
+        team_id=None,
+        metadata={},
+        budget_limits=[{"budget_duration": "30d", "max_budget": 100.0, "reset_at": "2026-08-01T00:00:00"}],
+    )
+
+    update_request = UpdateKeyRequest(
+        key="test-token",
+        budget_limits=[{"budget_duration": "30d", "max_budget": 100.0}],
+    )
+
+    result = await prepare_key_update_data(
+        data=update_request, existing_key_row=existing_key
+    )
+
+    assert "budget_limits" not in result
 
 
 @pytest.mark.asyncio
@@ -2063,6 +2127,57 @@ async def test_prepare_key_update_data_budget_limits_fresh_reset_at_for_new_dura
     assert windows["30d"]["reset_at"] == stored_reset_at
     assert windows["24h"]["reset_at"] is not None
     assert windows["24h"]["reset_at"] != stored_reset_at
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        [{"budget_duration": "30d"}],  # missing max_budget
+        [{"budget_duration": "30d", "max_budget": None}],  # null max_budget
+        [{"budget_duration": "30d", "max_budget": "abc"}],  # non-numeric max_budget
+        [{"max_budget": 100.0}],  # missing duration
+    ],
+)
+def test_normalize_budget_windows_skips_malformed_windows(malformed):
+    """A malformed stored/incoming window must be skipped, never raise, so a
+    legacy or hand-edited window can't turn every budget-carrying update into a
+    500."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _normalize_budget_windows,
+    )
+
+    assert _normalize_budget_windows(malformed) == ()
+
+
+def test_normalize_budget_windows_keeps_good_window_in_mixed_input():
+    """A well-formed window survives even when a malformed sibling is present."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _normalize_budget_windows,
+    )
+
+    assert _normalize_budget_windows(
+        [{"budget_duration": "30d", "max_budget": 100.0}, {"budget_duration": "7d"}]
+    ) == (("30d", 100.0),)
+
+
+def test_normalize_budget_windows_preserves_duplicate_multiplicity():
+    """Duplicates are kept (sorted tuple, not a set), so removing a duplicate
+    reads as a change; order of windows must not affect the identity."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _normalize_budget_windows,
+    )
+
+    two = _normalize_budget_windows(
+        [{"budget_duration": "30d", "max_budget": 100.0}, {"budget_duration": "30d", "max_budget": 100.0}]
+    )
+    one = _normalize_budget_windows([{"budget_duration": "30d", "max_budget": 100.0}])
+    assert two != one
+
+    assert _normalize_budget_windows(
+        [{"budget_duration": "30d", "max_budget": 100.0}, {"budget_duration": "24h", "max_budget": 10.0}]
+    ) == _normalize_budget_windows(
+        [{"budget_duration": "24h", "max_budget": 10.0}, {"budget_duration": "30d", "max_budget": 100.0}]
+    )
 
 
 @pytest.mark.asyncio
@@ -11068,6 +11183,38 @@ class TestKeyOwnerPrivilegeEscalation:
                 user_api_key_cache=MagicMock(),
             )
         mock_check.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_malformed_stored_budget_limits_does_not_crash(self):
+        """A malformed stored window (e.g. a legacy row missing max_budget) must
+        not KeyError/500 the update path. The change is still a real budget edit,
+        so it reaches the admin gate and raises 403 rather than crashing."""
+        existing = self._make_existing_key(created_by="creator-123")
+        existing.budget_limits = [{"budget_duration": "30d"}]  # malformed: no max_budget
+        data = UpdateKeyRequest(
+            key="sk-test", budget_limits=[{"budget_duration": "30d", "max_budget": 100.0}]
+        )
+        auth = self._make_auth(user_id="creator-123")
+
+        mock_check = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Not authorized")
+        )
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+            mock_check,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await _validate_update_key_data(
+                    data=data,
+                    existing_key_row=existing,
+                    user_api_key_dict=auth,
+                    llm_router=None,
+                    premium_user=False,
+                    prisma_client=AsyncMock(),
+                    user_api_key_cache=MagicMock(),
+                )
+        assert exc_info.value.status_code == 403
+        mock_check.assert_called_once()
 
 
 class TestKeyAliasSkipValidationOnUnchanged:

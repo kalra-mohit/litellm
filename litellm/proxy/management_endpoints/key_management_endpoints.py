@@ -1877,23 +1877,39 @@ def prepare_metadata_fields(data: BaseModel, non_default_values: dict, existing_
     return non_default_values
 
 
+def _budget_window_identity(window: dict | BudgetLimitEntry) -> tuple[str, float] | None:
+    """Identity of a single window, or None if it is malformed.
+
+    Returning None (rather than raising) keeps a legacy or hand-edited stored
+    window with a missing/non-numeric ``max_budget`` from turning every
+    ``/key/update`` that carries ``budget_limits`` into a 500.
+    """
+    if isinstance(window, dict):
+        duration = window.get("budget_duration")
+        max_budget = window.get("max_budget")
+    else:
+        duration = getattr(window, "budget_duration", None)
+        max_budget = getattr(window, "max_budget", None)
+    if not isinstance(duration, str) or isinstance(max_budget, bool) or not isinstance(max_budget, (int, float)):
+        return None
+    return (duration, float(max_budget))
+
+
 def _normalize_budget_windows(
     windows: list[dict | BudgetLimitEntry] | None,
-) -> frozenset[tuple[str, float]]:
-    """Reduce budget windows to their identity for change detection.
+) -> tuple[tuple[str, float], ...]:
+    """Reduce budget windows to a comparable, order-independent identity.
 
     A window is identified by ``(budget_duration, max_budget)``; ``reset_at`` is
     server-owned and deliberately excluded so a client echoing back stored
     windows (with or without ``reset_at``, in any order) reads as unchanged.
+    A sorted tuple (not a set) is used so identical windows keep their
+    multiplicity: adding or removing a duplicate window still reads as a change.
     """
     if not windows:
-        return frozenset()
-    return frozenset(
-        (str(w["budget_duration"]), float(w["max_budget"]))
-        if isinstance(w, dict)
-        else (str(w.budget_duration), float(w.max_budget))
-        for w in windows
-    )
+        return ()
+    identities = (_budget_window_identity(w) for w in windows)
+    return tuple(sorted(i for i in identities if i is not None))
 
 
 def _budget_limits_changed(
@@ -2001,7 +2017,13 @@ async def prepare_key_update_data(
 
     if "budget_limits" in non_default_values:
         raw_windows = non_default_values["budget_limits"]
-        if raw_windows:
+        if _normalize_budget_windows(raw_windows) == _normalize_budget_windows(existing_key_row.budget_limits):
+            # No real change (the dashboard echoes stored windows on every save).
+            # Don't rewrite the column: an unchanged resend would otherwise clobber
+            # a concurrent admin edit landing between this read and the write, and
+            # would needlessly re-serialize the row.
+            non_default_values.pop("budget_limits")
+        elif raw_windows:
             non_default_values["budget_limits"] = json.dumps(
                 _initialize_budget_windows(raw_windows, existing_key_row.budget_limits)
             )
