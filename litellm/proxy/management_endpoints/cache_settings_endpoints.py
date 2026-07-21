@@ -18,8 +18,8 @@ from pydantic import BaseModel, Field
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm._redis import _redis_kwargs_from_environment
 from litellm._uuid import uuid
-from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_keys
 from litellm.proxy._types import (
     AUDIT_ACTIONS,
     LiteLLM_AuditLogs,
@@ -65,6 +65,73 @@ def _resolve_cache_url_precedence(settings: Mapping[str, Any]) -> dict[str, Any]
     if not has_url or settings.get("redis_startup_nodes"):
         return dict(settings)
     return {k: v for k, v in settings.items() if k not in _URL_OVERRIDDEN_CONNECTION_FIELDS}
+
+
+def _parse_stored_settings(cache_settings_value: object) -> dict[str, Any]:
+    """Normalize a stored cache_settings blob to a dict.
+
+    The prisma column comes back as either a JSON string or an already-parsed
+    dict depending on the client, so callers that json.loads unconditionally
+    silently drop the whole (still-encrypted) row on the dict path.
+    """
+    parsed = json.loads(cache_settings_value) if isinstance(cache_settings_value, str) else cache_settings_value
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _overlay_environment(stored: Mapping[str, Any]) -> dict[str, Any]:
+    """Fill connection fields from the REDIS_* environment the cache actually reads.
+
+    A response cache pointed at Redis resolves host/port/password/etc. from the
+    REDIS_* env vars when the stored config leaves them unset, so a cache
+    configured purely through the environment works while its settings page,
+    which reads only the database row, shows blank. Overlaying the same env
+    kwargs the runtime uses makes the page reflect the effective connection.
+    Stored values win; the environment only fills what the stored config omits.
+    """
+    env_kwargs = _redis_kwargs_from_environment()
+    if not env_kwargs:
+        return dict(stored)
+    effective = {**env_kwargs, **stored}
+    # the env fallback is a Redis connection, so name the type when the stored
+    # config did not, letting the UI render the Redis fields it just populated
+    effective.setdefault("type", "redis")
+    return effective
+
+
+def _redact_credentials(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Replace credential-bearing values with a fixed marker, keeping the rest.
+
+    The marker is unambiguous on the way back in: an admin who edits an
+    unrelated field and re-submits sends the marker for the untouched secret,
+    which the update path maps back to the stored value rather than persisting
+    the marker over a working password.
+    """
+    return {
+        key: (_REDACTED_VALUE if key in _CACHE_SENSITIVE_FIELDS and value is not None else value)
+        for key, value in settings.items()
+    }
+
+
+def _merge_over_saved(incoming: Mapping[str, Any], saved: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the stored secret behind any credential the caller echoed back redacted or omitted.
+
+    GET returns credentials as the marker and the form never re-prefills a
+    secret, so a save that does not touch a credential arrives with the marker
+    or with the field absent. Either way the real secret must survive: it is
+    restored from the stored row, or dropped when there is no stored row (the
+    value is env-sourced and the marker must never be persisted). Non-secret
+    fields are taken from the incoming payload as-is, so clearing one still works.
+    """
+    merged = dict(incoming)
+    for field in _CACHE_SENSITIVE_FIELDS:
+        incoming_value = incoming.get(field)
+        if incoming_value is not None and incoming_value != _REDACTED_VALUE:
+            continue
+        if field in saved:
+            merged[field] = saved[field]
+        else:
+            merged.pop(field, None)
+    return merged
 
 
 def _redact_settings(settings: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -270,34 +337,32 @@ async def get_cache_settings(
         # Get cache settings fields from types file
         cache_fields = [field.model_copy(deep=True) for field in CACHE_SETTINGS_FIELDS]
 
-        # Try to get cache settings from database
-        current_values = {}
+        # Read the stored settings (decrypted); an env-only cache has none.
+        stored: dict[str, Any] = {}
         if prisma_client is not None:
             cache_config = await CacheConfigRepository(prisma_client).table.find_unique(where={"id": "cache_config"})
             if cache_config is not None and cache_config.cache_settings:
-                # Decrypt cache settings
-                cache_settings_json = cache_config.cache_settings
-                if isinstance(cache_settings_json, str):
-                    cache_settings_dict = json.loads(cache_settings_json)
-                else:
-                    cache_settings_dict = cache_settings_json
+                stored = proxy_config._decrypt_db_variables(
+                    variables_dict=_parse_stored_settings(cache_config.cache_settings)
+                )
 
-                # Decrypt environment variables
-                decrypted_settings = proxy_config._decrypt_db_variables(variables_dict=cache_settings_dict)
+        # Fill connection fields from the REDIS_* environment the cache resolves
+        # from when the stored config leaves them unset.
+        effective = _overlay_environment(stored)
 
-                # Derive redis_type for UI based on settings
-                # UI uses redis_type to show/hide fields, backend only stores 'type'
-                if decrypted_settings.get("type") == "redis":
-                    if decrypted_settings.get("redis_startup_nodes"):
-                        decrypted_settings["redis_type"] = "cluster"
-                    elif decrypted_settings.get("sentinel_nodes"):
-                        decrypted_settings["redis_type"] = "sentinel"
-                    else:
-                        decrypted_settings["redis_type"] = "node"
+        # Derive redis_type for UI based on settings
+        # UI uses redis_type to show/hide fields, backend only stores 'type'
+        if effective.get("type") == "redis":
+            if effective.get("redis_startup_nodes"):
+                effective["redis_type"] = "cluster"
+            elif effective.get("sentinel_nodes"):
+                effective["redis_type"] = "sentinel"
+            else:
+                effective["redis_type"] = "node"
 
-                # Mask credential fields so the GET response never carries
-                # plaintext Redis / Sentinel passwords off the server.
-                current_values = mask_sensitive_keys(decrypted_settings, _CACHE_SENSITIVE_FIELDS)
+        # Redact credential fields so the GET response never carries a plaintext
+        # Redis / Sentinel password off the server.
+        current_values = _redact_credentials(effective)
 
         # Update field values with current values
         for field in cache_fields:
@@ -331,9 +396,25 @@ async def test_cache_connection(
     to verify the credentials work without affecting global state.
     """
     from litellm import Cache
+    from litellm.proxy.proxy_server import prisma_client, proxy_config
 
     try:
-        cache_settings = _resolve_cache_url_precedence(request.cache_settings)
+        # A credential the form left untouched arrives redacted; resolve it back
+        # to the stored secret so the test connects with the real password. A
+        # lookup failure must not block the test, so fall back to no stored row.
+        saved_settings: dict[str, Any] = {}
+        if prisma_client is not None:
+            try:
+                existing_row = await CacheConfigRepository(prisma_client).table.find_unique(
+                    where={"id": "cache_config"}
+                )
+                if existing_row is not None and existing_row.cache_settings:
+                    saved_settings = proxy_config._decrypt_db_variables(
+                        variables_dict=_parse_stored_settings(existing_row.cache_settings)
+                    )
+            except Exception:  # noqa: BLE001 - a saved-settings lookup failure must not block a connection test
+                saved_settings = {}
+        cache_settings = _resolve_cache_url_precedence(_merge_over_saved(request.cache_settings, saved_settings))
         verbose_proxy_logger.debug("Testing cache connection with settings: %s", cache_settings)
 
         # Only support Redis for now
@@ -400,18 +481,19 @@ async def update_cache_settings(
         )
 
     try:
-        cache_settings = _resolve_cache_url_precedence(request.cache_settings)
-
-        # Snapshot the prior settings (key set only — values get redacted in
-        # the audit row) so the audit-log entry shows which fields changed.
+        # Read the stored row first: its decrypted values back any credential the
+        # caller echoed back redacted, and its key set drives the audit diff.
         existing_row = await CacheConfigRepository(prisma_client).table.find_unique(where={"id": "cache_config"})
         before_settings: Optional[Dict[str, Any]] = None
+        saved_settings: dict[str, Any] = {}
         if existing_row is not None and existing_row.cache_settings:
-            try:
-                before_settings = json.loads(existing_row.cache_settings)
-            except (TypeError, ValueError):
-                before_settings = None
+            before_settings = _parse_stored_settings(existing_row.cache_settings)
+            saved_settings = proxy_config._decrypt_db_variables(variables_dict=before_settings)
         action: AUDIT_ACTIONS = "updated" if existing_row is not None else "created"
+
+        # Preserve stored secrets behind any redacted or omitted credential, then
+        # resolve the url-vs-discrete-fields precedence.
+        cache_settings = _resolve_cache_url_precedence(_merge_over_saved(request.cache_settings, saved_settings))
 
         # Encrypt sensitive fields (keep redis_type for storage)
         encrypted_settings = proxy_config._encrypt_env_variables(environment_variables=cache_settings)
@@ -461,7 +543,7 @@ async def update_cache_settings(
         return {
             "message": "Cache settings updated successfully",
             "status": "success",
-            "settings": cache_settings,
+            "settings": _redact_credentials(cache_settings),
         }
     except Exception as e:
         verbose_proxy_logger.error(f"Error updating cache settings: {str(e)}")

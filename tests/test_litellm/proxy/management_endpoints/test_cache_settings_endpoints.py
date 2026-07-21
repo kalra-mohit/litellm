@@ -17,9 +17,14 @@ from litellm.proxy._types import LitellmTableNames, LitellmUserRoles
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth
 from litellm.proxy.management_endpoints.cache_settings_endpoints import (
     _CACHE_SENSITIVE_FIELDS,
+    _REDACTED_VALUE,
     CacheSettingsManager,
     CacheSettingsUpdateRequest,
     CacheTestRequest,
+    _merge_over_saved,
+    _overlay_environment,
+    _parse_stored_settings,
+    _redact_credentials,
     _resolve_cache_url_precedence,
     get_cache_settings,
     test_cache_connection,
@@ -610,3 +615,266 @@ async def test_update_cache_settings_no_audit_when_disabled(monkeypatch):
         )
 
     assert audit_calls == []
+
+
+class TestParseStoredSettings:
+    """The stored blob arrives as a JSON string or a parsed dict; both must
+    normalize to a dict so the secret-preservation read never silently drops it."""
+
+    def test_parses_a_json_string(self):
+        assert _parse_stored_settings('{"host": "h", "password": "pw"}') == {"host": "h", "password": "pw"}
+
+    def test_passes_a_dict_through(self):
+        assert _parse_stored_settings({"host": "h", "password": "pw"}) == {"host": "h", "password": "pw"}
+
+    def test_non_mapping_becomes_empty(self):
+        assert _parse_stored_settings(None) == {}
+        assert _parse_stored_settings("[1, 2]") == {}
+
+
+class TestMergeOverSaved:
+    """The secret-preservation contract behind the redacted-resubmit fix."""
+
+    def test_redacted_secret_restores_stored_value(self):
+        merged = _merge_over_saved(
+            incoming={"type": "redis", "host": "newhost", "password": _REDACTED_VALUE},
+            saved={"type": "redis", "host": "oldhost", "password": "realpw"},
+        )
+        assert merged["host"] == "newhost"
+        assert merged["password"] == "realpw"
+
+    def test_omitted_secret_restores_stored_value(self):
+        merged = _merge_over_saved(
+            incoming={"type": "redis", "host": "newhost"},
+            saved={"type": "redis", "password": "realpw"},
+        )
+        assert merged["password"] == "realpw"
+
+    def test_redacted_secret_with_no_stored_value_is_dropped(self):
+        # env-sourced secret: nothing stored to restore, so the marker must not
+        # be persisted; the environment stays the source at runtime
+        merged = _merge_over_saved(
+            incoming={"type": "redis", "host": "h", "password": _REDACTED_VALUE},
+            saved={},
+        )
+        assert "password" not in merged
+
+    def test_new_secret_value_wins(self):
+        merged = _merge_over_saved(
+            incoming={"password": "brandnewpw"},
+            saved={"password": "realpw"},
+        )
+        assert merged["password"] == "brandnewpw"
+
+
+def test_overlay_environment_fills_unset_connection_fields(monkeypatch):
+    """A cache with no stored connection resolves REDIS_* env for the UI."""
+    for var in ("REDIS_URL", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_USERNAME"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("REDIS_HOST", "redis.internal")
+    monkeypatch.setenv("REDIS_PORT", "6380")
+    monkeypatch.setenv("REDIS_PASSWORD", "env-password")
+
+    effective = _overlay_environment({})
+
+    assert effective["host"] == "redis.internal"
+    assert effective["port"] == "6380"
+    assert effective["password"] == "env-password"
+    assert effective["type"] == "redis"
+
+
+def test_overlay_environment_stored_value_wins(monkeypatch):
+    monkeypatch.setenv("REDIS_HOST", "env-host")
+    effective = _overlay_environment({"type": "redis", "host": "stored-host"})
+    assert effective["host"] == "stored-host"
+
+
+@pytest.mark.asyncio
+async def test_get_cache_settings_falls_back_to_redis_env(monkeypatch):
+    """A cache configured purely through REDIS_* env vars shows its effective
+    connection instead of a blank page, with the password redacted."""
+    for var in ("REDIS_URL", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_USERNAME"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("REDIS_HOST", "redis.internal")
+    monkeypatch.setenv("REDIS_PORT", "6380")
+    monkeypatch.setenv("REDIS_PASSWORD", "env-password")
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_cacheconfig.find_unique = AsyncMock(return_value=None)
+
+    proxy_config = MagicMock()
+    proxy_config._decrypt_db_variables = MagicMock(side_effect=lambda variables_dict: dict(variables_dict))
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch("litellm.proxy.proxy_server.proxy_config", proxy_config),
+    ):
+        response = await get_cache_settings(user_api_key_dict=_admin_auth())
+
+    values = response.current_values
+    assert values["host"] == "redis.internal"
+    assert values["port"] == "6380"
+    assert values["type"] == "redis"
+    # the env password is surfaced as configured, not leaked in plaintext
+    assert values["password"] == _REDACTED_VALUE
+
+
+@pytest.mark.asyncio
+async def test_get_cache_settings_redacts_password_with_marker(monkeypatch):
+    for var in ("REDIS_URL", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_USERNAME"):
+        monkeypatch.delenv(var, raising=False)
+    cache_row = MagicMock()
+    cache_row.cache_settings = json.dumps(
+        {"type": "redis", "host": "h", "password": "supersecret", "namespace": "ns"}
+    )
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_cacheconfig.find_unique = AsyncMock(return_value=cache_row)
+    proxy_config = MagicMock()
+    proxy_config._decrypt_db_variables = MagicMock(side_effect=lambda variables_dict: dict(variables_dict))
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch("litellm.proxy.proxy_server.proxy_config", proxy_config),
+    ):
+        response = await get_cache_settings(user_api_key_dict=_admin_auth())
+
+    assert response.current_values["password"] == _REDACTED_VALUE
+    assert response.current_values["namespace"] == "ns"
+
+
+def _mock_proxy_config_identity_crypto():
+    proxy_config = MagicMock()
+    proxy_config._encrypt_env_variables = MagicMock(
+        side_effect=lambda environment_variables: dict(environment_variables)
+    )
+    proxy_config._decrypt_db_variables = MagicMock(side_effect=lambda variables_dict: dict(variables_dict))
+    proxy_config._init_cache = MagicMock()
+    proxy_config.switch_on_llm_response_caching = MagicMock()
+    return proxy_config
+
+
+@pytest.mark.asyncio
+async def test_update_preserves_stored_password_on_redacted_resubmit(monkeypatch):
+    """Editing an unrelated field and re-submitting the redacted password must
+    keep the stored secret, not persist the marker over a working password."""
+    monkeypatch.setattr(litellm, "store_audit_logs", False)
+
+    existing = MagicMock()
+    # prisma returns the Json column as an already-parsed dict, not a JSON
+    # string; a reader that json.loads unconditionally would drop the whole row
+    existing.cache_settings = {"type": "redis", "host": "oldhost", "password": "realpw"}
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_cacheconfig.find_unique = AsyncMock(return_value=existing)
+    mock_prisma.db.litellm_cacheconfig.upsert = AsyncMock()
+    proxy_config = _mock_proxy_config_identity_crypto()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch("litellm.proxy.proxy_server.proxy_config", proxy_config),
+        patch("litellm.proxy.proxy_server.store_model_in_db", True),
+    ):
+        result = await update_cache_settings(
+            request=CacheSettingsUpdateRequest(
+                cache_settings={"type": "redis", "host": "newhost", "password": _REDACTED_VALUE}
+            ),
+            user_api_key_dict=_admin_auth(),
+            litellm_changed_by=None,
+        )
+
+    persisted = proxy_config._encrypt_env_variables.call_args.kwargs["environment_variables"]
+    assert persisted["host"] == "newhost"
+    assert persisted["password"] == "realpw"
+    # the response never echoes the plaintext secret back either
+    assert result["settings"]["password"] == _REDACTED_VALUE
+
+
+@pytest.mark.asyncio
+async def test_update_drops_env_sourced_redacted_secret(monkeypatch):
+    """With no stored row, a re-submitted redacted secret is env-sourced; the
+    marker must not be persisted so the environment stays the source."""
+    monkeypatch.setattr(litellm, "store_audit_logs", False)
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_cacheconfig.find_unique = AsyncMock(return_value=None)
+    mock_prisma.db.litellm_cacheconfig.upsert = AsyncMock()
+    proxy_config = _mock_proxy_config_identity_crypto()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch("litellm.proxy.proxy_server.proxy_config", proxy_config),
+        patch("litellm.proxy.proxy_server.store_model_in_db", True),
+    ):
+        await update_cache_settings(
+            request=CacheSettingsUpdateRequest(
+                cache_settings={"type": "redis", "host": "h", "password": _REDACTED_VALUE}
+            ),
+            user_api_key_dict=_admin_auth(),
+            litellm_changed_by=None,
+        )
+
+    persisted = proxy_config._encrypt_env_variables.call_args.kwargs["environment_variables"]
+    assert "password" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_update_applies_new_password(monkeypatch):
+    """A real new secret value replaces the stored one."""
+    monkeypatch.setattr(litellm, "store_audit_logs", False)
+
+    existing = MagicMock()
+    existing.cache_settings = json.dumps({"type": "redis", "host": "h", "password": "oldpw"})
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_cacheconfig.find_unique = AsyncMock(return_value=existing)
+    mock_prisma.db.litellm_cacheconfig.upsert = AsyncMock()
+    proxy_config = _mock_proxy_config_identity_crypto()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch("litellm.proxy.proxy_server.proxy_config", proxy_config),
+        patch("litellm.proxy.proxy_server.store_model_in_db", True),
+    ):
+        await update_cache_settings(
+            request=CacheSettingsUpdateRequest(
+                cache_settings={"type": "redis", "host": "h", "password": "brandnewpw"}
+            ),
+            user_api_key_dict=_admin_auth(),
+            litellm_changed_by=None,
+        )
+
+    persisted = proxy_config._encrypt_env_variables.call_args.kwargs["environment_variables"]
+    assert persisted["password"] == "brandnewpw"
+
+
+@pytest.mark.asyncio
+async def test_test_cache_connection_survives_saved_lookup_failure(monkeypatch):
+    """A failed saved-settings lookup must not block the connection test.
+
+    The test endpoint reads the stored row to resolve a redacted credential, but
+    that read can raise (a misconfigured or unavailable client), and it must fall
+    back to the submitted settings rather than abort — otherwise a shared client
+    left in an odd state by another test would break every connection test.
+    """
+    monkeypatch.setattr(litellm, "store_audit_logs", False)
+
+    # a client whose find_unique is not awaitable, so the saved read raises
+    bad_prisma = MagicMock()
+    proxy_config = MagicMock()
+    proxy_config._decrypt_db_variables = MagicMock(side_effect=lambda variables_dict: dict(variables_dict))
+
+    cache_instance = MagicMock()
+    cache_instance.cache = MagicMock()
+    cache_instance.cache.test_connection = AsyncMock(return_value={"status": "success", "message": "ok"})
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", bad_prisma),
+        patch("litellm.proxy.proxy_server.proxy_config", proxy_config),
+        patch("litellm.Cache") as mock_cache_class,
+    ):
+        mock_cache_class.return_value = cache_instance
+        result = await test_cache_connection(
+            request=CacheTestRequest(cache_settings={"type": "redis", "host": "h", "port": "6379", "password": "pw"}),
+            user_api_key_dict=_admin_auth(),
+        )
+
+    mock_cache_class.assert_called_once()
+    assert result.status == "success"
