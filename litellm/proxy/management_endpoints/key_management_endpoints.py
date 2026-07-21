@@ -1877,6 +1877,74 @@ def prepare_metadata_fields(data: BaseModel, non_default_values: dict, existing_
     return non_default_values
 
 
+def _normalize_budget_windows(
+    windows: list[dict | BudgetLimitEntry] | None,
+) -> frozenset[tuple[str, float]]:
+    """Reduce budget windows to their identity for change detection.
+
+    A window is identified by ``(budget_duration, max_budget)``; ``reset_at`` is
+    server-owned and deliberately excluded so a client echoing back stored
+    windows (with or without ``reset_at``, in any order) reads as unchanged.
+    """
+    if not windows:
+        return frozenset()
+    return frozenset(
+        (str(w["budget_duration"]), float(w["max_budget"]))
+        if isinstance(w, dict)
+        else (str(w.budget_duration), float(w.max_budget))
+        for w in windows
+    )
+
+
+def _budget_limits_changed(
+    data: UpdateKeyRequest,
+    existing_key_row: LiteLLM_VerificationToken,
+) -> bool:
+    """True only when the request actually mutates the stored budget windows.
+
+    The dashboard re-sends a key's existing windows on every save (issue
+    #33246), so gating the admin check on mere presence in ``model_fields_set``
+    blocks a non-admin owner from any edit. Compare normalized identities
+    instead: adding, removing, or re-capping a window counts; an identical
+    resend (or an explicit empty value on a key that has no windows) does not.
+    """
+    if "budget_limits" not in data.model_fields_set:
+        return False
+    return _normalize_budget_windows(data.budget_limits) != _normalize_budget_windows(existing_key_row.budget_limits)
+
+
+def _initialize_budget_windows(
+    incoming_windows: list[dict | BudgetLimitEntry],
+    existing_windows: list[dict] | None,
+) -> list[dict]:
+    """Attach a ``reset_at`` to each window, persistence-ready.
+
+    The per-window spend counter is keyed on ``budget_duration`` and is never
+    zeroed on write, so re-minting ``reset_at`` for a duration that already
+    exists would slide its reset schedule forward while spend keeps
+    accumulating (and, on a cold counter cache, retroactively drop spend that
+    now falls before the moved window start). Preserve the stored ``reset_at``
+    for any incoming duration that already has one, mint a fresh ``reset_at``
+    only for a genuinely new duration, and always ignore a client-supplied
+    ``reset_at``.
+    """
+    from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
+
+    existing_reset_at = {
+        w["budget_duration"]: w["reset_at"]
+        for w in (existing_windows or [])
+        if isinstance(w, dict) and w.get("budget_duration") and w.get("reset_at")
+    }
+
+    def _with_reset_at(window: dict | BudgetLimitEntry) -> dict:
+        w = window if isinstance(window, dict) else window.model_dump()
+        duration = w["budget_duration"]
+        reset_at = existing_reset_at.get(duration) or get_budget_reset_time(budget_duration=duration).isoformat()
+        return {**w, "reset_at": reset_at}
+
+    return [_with_reset_at(w) for w in incoming_windows]
+
+
 async def prepare_key_update_data(
     data: Union[UpdateKeyRequest, RegenerateKeyRequest],
     existing_key_row: LiteLLM_VerificationToken,
@@ -1934,14 +2002,9 @@ async def prepare_key_update_data(
     if "budget_limits" in non_default_values:
         raw_windows = non_default_values["budget_limits"]
         if raw_windows:
-            from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
-
-            initialized_windows = []
-            for window in raw_windows:
-                w = window if isinstance(window, dict) else window.model_dump()
-                w["reset_at"] = get_budget_reset_time(budget_duration=w["budget_duration"]).isoformat()
-                initialized_windows.append(w)
-            non_default_values["budget_limits"] = json.dumps(initialized_windows)
+            non_default_values["budget_limits"] = json.dumps(
+                _initialize_budget_windows(raw_windows, existing_key_row.budget_limits)
+            )
         else:
             # [] / None clears the field; prisma-client-py has no DbNull
             # sentinel for Json? columns, so store the JSON literal null
@@ -2324,9 +2387,11 @@ async def _validate_update_key_data(
     #   / key-owner / team-admin / org-admin of the key).
     # - max_budget / spend / budget_limits: always require the admin
     #   check, even for the key owner or a team member (matches the
-    #   existing admin-only budget semantics).  budget_limits uses
-    #   model_fields_set because an explicit null/[] clears the field
-    #   and must gate the same as setting or changing it.
+    #   existing admin-only budget semantics).  max_budget and
+    #   budget_limits gate on a value diff, so re-sending the stored
+    #   value is a no-op that the owner may save (the dashboard echoes
+    #   both back on every save; issue #33246). Adding, removing, or
+    #   changing a window still requires admin.
     # - spend gates on presence alone (not a value diff): the DB spend
     #   lags the live cross-pod counter, so letting an "unchanged" spend
     #   through the non-admin path would let a key owner / team member
@@ -2335,7 +2400,7 @@ async def _validate_update_key_data(
     _is_budget_change = (
         (data.max_budget is not None and data.max_budget != existing_key_row.max_budget)
         or data.spend is not None
-        or "budget_limits" in data.model_fields_set
+        or _budget_limits_changed(data, existing_key_row)
     )
 
     _existing_metadata = getattr(existing_key_row, "metadata", None)

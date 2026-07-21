@@ -307,14 +307,30 @@ export function KeyEditView({
       }
 
       // Reconcile multi-window budget limits from the editor state, dropping
-      // incomplete entries (no max_budget). Sending [] tells the backend to clear
-      // all stored windows, so only send it when the user removed every window;
-      // when entries remain but are still incomplete, omit the field so the saved
-      // windows are left untouched (JSON.stringify drops the undefined key).
+      // incomplete entries (no max_budget). The backend treats any real change
+      // to budget_limits as an admin-only budget change, so re-sending the
+      // stored windows unchanged 403s a non-admin key owner (issue #33246).
+      // Mirror the allowed_routes handling above: compare on (duration, cap)
+      // ignoring server-owned reset_at, and only send the field when it differs.
+      // Sending [] clears every window, so send it only when the user removed
+      // the last one; leave the field off otherwise (JSON.stringify drops the
+      // undefined key) so incomplete or unchanged state never clobbers storage.
+      const windowSignature = (windows: Array<{ budget_duration: string; max_budget: number | null }> | undefined) =>
+        new Set(
+          (windows ?? [])
+            .filter((w) => w.budget_duration && w.max_budget !== null && w.max_budget !== undefined)
+            .map((w) => `${w.budget_duration}:${w.max_budget}`),
+        );
       const validWindows = budgetLimits.filter(
         (w) => w.budget_duration && w.max_budget !== null && w.max_budget !== undefined,
       );
-      if (validWindows.length > 0) {
+      const storedWindows = windowSignature(keyData.budget_limits);
+      const submittedWindows = windowSignature(validWindows);
+      const budgetLimitsUnchanged =
+        storedWindows.size === submittedWindows.size && [...submittedWindows].every((w) => storedWindows.has(w));
+      if (budgetLimitsUnchanged) {
+        // no-op: leave budget_limits off the payload
+      } else if (validWindows.length > 0) {
         values.budget_limits = validWindows;
       } else if (budgetLimits.length === 0) {
         values.budget_limits = [];

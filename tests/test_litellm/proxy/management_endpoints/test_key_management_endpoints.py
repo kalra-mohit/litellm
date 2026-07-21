@@ -1999,6 +1999,73 @@ async def test_prepare_key_update_data_budget_limits_serializes_windows():
 
 
 @pytest.mark.asyncio
+async def test_prepare_key_update_data_budget_limits_preserves_reset_at_on_cap_change():
+    """The per-window spend counter is keyed on budget_duration and is never
+    zeroed on write, so changing only the cap of an existing duration must keep
+    the stored reset_at; re-minting it would slide the reset schedule forward
+    (window never resets) or, on a cold cache, retroactively drop spend."""
+    from litellm.proxy._types import UpdateKeyRequest
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        prepare_key_update_data,
+    )
+
+    stored_reset_at = "2026-08-01T00:00:00"
+    existing_key = LiteLLM_VerificationToken(
+        token="test-token",
+        user_id="test-user",
+        team_id=None,
+        metadata={},
+        budget_limits=[{"budget_duration": "30d", "max_budget": 100.0, "reset_at": stored_reset_at}],
+    )
+
+    update_request = UpdateKeyRequest(
+        key="test-token",
+        # client echoes a different reset_at; server must ignore it
+        budget_limits=[{"budget_duration": "30d", "max_budget": 200.0, "reset_at": "1999-01-01T00:00:00"}],
+    )
+
+    result = await prepare_key_update_data(data=update_request, existing_key_row=existing_key)
+
+    windows = json.loads(result["budget_limits"])
+    assert windows[0]["max_budget"] == 200.0
+    assert windows[0]["reset_at"] == stored_reset_at
+
+
+@pytest.mark.asyncio
+async def test_prepare_key_update_data_budget_limits_fresh_reset_at_for_new_duration():
+    """A genuinely new duration has no counter to protect, so it gets a fresh
+    reset_at while the untouched existing duration keeps its stored one."""
+    from litellm.proxy._types import UpdateKeyRequest
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        prepare_key_update_data,
+    )
+
+    stored_reset_at = "2026-08-01T00:00:00"
+    existing_key = LiteLLM_VerificationToken(
+        token="test-token",
+        user_id="test-user",
+        team_id=None,
+        metadata={},
+        budget_limits=[{"budget_duration": "30d", "max_budget": 100.0, "reset_at": stored_reset_at}],
+    )
+
+    update_request = UpdateKeyRequest(
+        key="test-token",
+        budget_limits=[
+            {"budget_duration": "30d", "max_budget": 100.0},
+            {"budget_duration": "24h", "max_budget": 10.0},
+        ],
+    )
+
+    result = await prepare_key_update_data(data=update_request, existing_key_row=existing_key)
+
+    windows = {w["budget_duration"]: w for w in json.loads(result["budget_limits"])}
+    assert windows["30d"]["reset_at"] == stored_reset_at
+    assert windows["24h"]["reset_at"] is not None
+    assert windows["24h"]["reset_at"] != stored_reset_at
+
+
+@pytest.mark.asyncio
 async def test_prepare_key_update_data_disable_global_guardrails_false_no_premium(
     monkeypatch,
 ):
@@ -10628,6 +10695,7 @@ class TestKeyOwnerPrivilegeEscalation:
         row.spend = 0.0
         row.organization_id = None
         row.project_id = None
+        row.budget_limits = None
         return row
 
     def _make_auth(self, user_id="creator-123"):
@@ -10782,9 +10850,12 @@ class TestKeyOwnerPrivilegeEscalation:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("cleared_value", [[], None])
     async def test_creator_cannot_clear_own_budget_limits(self, cleared_value):
-        """Clearing budget_limits is a budget change and requires admin."""
+        """Clearing a real budget window is a budget change and requires admin."""
         data = UpdateKeyRequest(key="sk-test", budget_limits=cleared_value)
         existing = self._make_existing_key(created_by="creator-123")
+        existing.budget_limits = [
+            {"budget_duration": "30d", "max_budget": 100.0, "reset_at": "2026-08-01T00:00:00"}
+        ]
         auth = self._make_auth(user_id="creator-123")
 
         mock_check = AsyncMock(
@@ -10830,6 +10901,147 @@ class TestKeyOwnerPrivilegeEscalation:
                 user_api_key_cache=MagicMock(),
             )
         mock_check.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cleared_value", [[], None])
+    async def test_creator_empty_budget_limits_on_key_without_windows_is_noop(self, cleared_value):
+        """Issue #33246 core repro: the dashboard sends budget_limits=[] on every
+        save. On a key that has no stored windows that is a no-op, so a non-admin
+        owner must be able to save without the admin check (previously 403)."""
+        data = UpdateKeyRequest(key="sk-test", key_alias="renamed", budget_limits=cleared_value)
+        existing = self._make_existing_key(created_by="creator-123")  # budget_limits defaults to None
+        auth = self._make_auth(user_id="creator-123")
+
+        mock_check = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Not authorized")
+        )
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+            mock_check,
+        ):
+            await _validate_update_key_data(
+                data=data,
+                existing_key_row=existing,
+                user_api_key_dict=auth,
+                llm_router=None,
+                premium_user=False,
+                prisma_client=AsyncMock(),
+                user_api_key_cache=MagicMock(),
+            )
+        mock_check.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "resent_windows",
+        [
+            [{"budget_duration": "30d", "max_budget": 100.0}],
+            # reordered + client-supplied reset_at must still read as unchanged
+            [
+                {"budget_duration": "24h", "max_budget": 10.0, "reset_at": "1999-01-01T00:00:00"},
+                {"budget_duration": "30d", "max_budget": 100.0, "reset_at": "1999-01-01T00:00:00"},
+            ],
+        ],
+    )
+    async def test_creator_can_resend_unchanged_budget_limits(self, resent_windows):
+        """Re-sending the key's existing windows (any order, ignoring reset_at) is
+        a no-op and must not require admin. Second param resends both stored
+        windows reordered; single-window param covers the common case."""
+        stored = [
+            {"budget_duration": "30d", "max_budget": 100.0, "reset_at": "2026-08-01T00:00:00"},
+            {"budget_duration": "24h", "max_budget": 10.0, "reset_at": "2026-07-22T00:00:00"},
+        ]
+        # single-window param compares against a single stored window
+        existing = self._make_existing_key(created_by="creator-123")
+        existing.budget_limits = stored if len(resent_windows) == 2 else [stored[0]]
+        data = UpdateKeyRequest(key="sk-test", budget_limits=resent_windows)
+        auth = self._make_auth(user_id="creator-123")
+
+        mock_check = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Not authorized")
+        )
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+            mock_check,
+        ):
+            await _validate_update_key_data(
+                data=data,
+                existing_key_row=existing,
+                user_api_key_dict=auth,
+                llm_router=None,
+                premium_user=False,
+                prisma_client=AsyncMock(),
+                user_api_key_cache=MagicMock(),
+            )
+        mock_check.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "changed_windows",
+        [
+            [{"budget_duration": "30d", "max_budget": 200.0}],  # cap change
+            [
+                {"budget_duration": "30d", "max_budget": 100.0},
+                {"budget_duration": "24h", "max_budget": 10.0},
+            ],  # window added
+            [{"budget_duration": "7d", "max_budget": 100.0}],  # duration change
+        ],
+    )
+    async def test_creator_changing_budget_windows_requires_admin(self, changed_windows):
+        """Adding, re-capping, or changing the duration of a window is a real
+        budget change and must route through the admin check."""
+        existing = self._make_existing_key(created_by="creator-123")
+        existing.budget_limits = [
+            {"budget_duration": "30d", "max_budget": 100.0, "reset_at": "2026-08-01T00:00:00"}
+        ]
+        data = UpdateKeyRequest(key="sk-test", budget_limits=changed_windows)
+        auth = self._make_auth(user_id="creator-123")
+
+        mock_check = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Not authorized")
+        )
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+            mock_check,
+        ):
+            with pytest.raises(HTTPException):
+                await _validate_update_key_data(
+                    data=data,
+                    existing_key_row=existing,
+                    user_api_key_dict=auth,
+                    llm_router=None,
+                    premium_user=False,
+                    prisma_client=AsyncMock(),
+                    user_api_key_cache=MagicMock(),
+                )
+        mock_check.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_creator_setting_first_budget_window_requires_admin(self):
+        """Setting a budget on a key that had none is still admin-only (#33194)."""
+        existing = self._make_existing_key(created_by="creator-123")  # no stored windows
+        data = UpdateKeyRequest(
+            key="sk-test", budget_limits=[{"budget_duration": "24h", "max_budget": 5.0}]
+        )
+        auth = self._make_auth(user_id="creator-123")
+
+        mock_check = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Not authorized")
+        )
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+            mock_check,
+        ):
+            with pytest.raises(HTTPException):
+                await _validate_update_key_data(
+                    data=data,
+                    existing_key_row=existing,
+                    user_api_key_dict=auth,
+                    llm_router=None,
+                    premium_user=False,
+                    prisma_client=AsyncMock(),
+                    user_api_key_cache=MagicMock(),
+                )
+        mock_check.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_admin_can_update_any_field(self):
